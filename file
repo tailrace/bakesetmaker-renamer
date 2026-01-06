@@ -1,0 +1,251 @@
+#author suman
+#https://www.artstation.com/sumanhere
+
+import bpy
+import mathutils
+import random
+
+# --------------------------------------------------
+# UTILS
+# --------------------------------------------------
+
+def centroid(obj):
+    c = mathutils.Vector((0, 0, 0))
+    for v in obj.data.vertices:
+        c += obj.matrix_world @ v.co
+    return c / len(obj.data.vertices)
+
+
+def mesh_density(obj):
+    bbox = [obj.matrix_world @ mathutils.Vector(v) for v in obj.bound_box]
+    min_v = mathutils.Vector(map(min, zip(*bbox)))
+    max_v = mathutils.Vector(map(max, zip(*bbox)))
+    size = max_v - min_v
+    vol = max(size.x * size.y * size.z, 1e-6)
+    return len(obj.data.vertices) / vol
+
+
+def centroids_close(c1, c2, threshold):
+    return (c1 - c2).length < threshold
+
+
+# --------------------------------------------------
+# DATA
+# --------------------------------------------------
+
+class MeshSetItem(bpy.types.PropertyGroup):
+    set_id: bpy.props.IntProperty()
+    high: bpy.props.PointerProperty(type=bpy.types.Object)
+    low: bpy.props.PointerProperty(type=bpy.types.Object)
+
+
+# --------------------------------------------------
+# TOGGLE CALLBACKS
+# --------------------------------------------------
+
+def update_hide_high(self, context):
+    for s in self.mesh_sets:
+        if s.high:
+            s.high.hide_set(self.hide_high)
+
+
+def update_hide_low(self, context):
+    for s in self.mesh_sets:
+        if s.low:
+            s.low.hide_set(self.hide_low)
+
+
+# --------------------------------------------------
+# OPERATORS
+# --------------------------------------------------
+
+class OBJECT_OT_CaptureMeshes(bpy.types.Operator):
+    bl_idname = "object.capture_close_meshes"
+    bl_label = "Capture Meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        scene.mesh_sets.clear()
+
+        meshes = [o for o in context.selected_objects if o.type == 'MESH']
+        if len(meshes) < 2:
+            self.report({'ERROR'}, "Select at least two meshes")
+            return {'CANCELLED'}
+
+        for o in meshes:
+            if "orig_loc" not in o:
+                o["orig_loc"] = list(o.location)
+
+        cents = {o: centroid(o) for o in meshes}
+        used = set()
+        set_id = 1
+
+        for i in range(len(meshes)):
+            if meshes[i] in used:
+                continue
+
+            for j in range(i + 1, len(meshes)):
+                if meshes[j] in used:
+                    continue
+
+                if centroids_close(
+                    cents[meshes[i]],
+                    cents[meshes[j]],
+                    scene.centroid_threshold
+                ):
+                    d1 = mesh_density(meshes[i])
+                    d2 = mesh_density(meshes[j])
+
+                    high, low = (
+                        (meshes[i], meshes[j])
+                        if d1 >= d2
+                        else (meshes[j], meshes[i])
+                    )
+
+                    item = scene.mesh_sets.add()
+                    item.set_id = set_id
+                    item.high = high
+                    item.low = low
+
+                    used.update({meshes[i], meshes[j]})
+                    set_id += 1
+                    break
+
+        self.report({'INFO'}, f"Captured {len(scene.mesh_sets)} mesh sets")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_MoveCapturedMeshes(bpy.types.Operator):
+    bl_idname = "object.move_captured_meshes"
+    bl_label = "Move Captured Meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        for s in context.scene.mesh_sets:
+            rand = mathutils.Vector((
+                random.uniform(-30, 30),
+                random.uniform(-30, 30),
+                random.uniform(-30, 30),
+            ))
+            s.high.location = rand
+            s.low.location = rand
+        return {'FINISHED'}
+
+
+class OBJECT_OT_RenameCapturedMeshes(bpy.types.Operator):
+    bl_idname = "object.rename_captured_meshes"
+    bl_label = "Rename Mesh Sets"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        for s in context.scene.mesh_sets:
+            s.high.name = f"mesh_{s.set_id}_high"
+            s.low.name = f"mesh_{s.set_id}_low"
+        return {'FINISHED'}
+
+
+class OBJECT_OT_ResetOriginalPositions(bpy.types.Operator):
+    bl_idname = "object.reset_original_positions"
+    bl_label = "Restore Original Positions"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        for s in context.scene.mesh_sets:
+            for o in (s.high, s.low):
+                if o and "orig_loc" in o:
+                    o.location = mathutils.Vector(o["orig_loc"])
+        return {'FINISHED'}
+
+
+# --------------------------------------------------
+# UI PANEL
+# --------------------------------------------------
+
+class OBJECT_PT_MoveCloseMeshes(bpy.types.Panel):
+    bl_idname = "OBJECT_PT_move_close_meshes_MAIN"
+    bl_label = "BakesetMaker/Renamer"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Bakeset_Maker'
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        has_sets = len(scene.mesh_sets) > 0
+
+        layout.prop(scene, "centroid_threshold")
+        layout.operator("object.capture_close_meshes", icon='VIEWZOOM')
+
+        layout.separator()
+
+        col = layout.column()
+        col.enabled = has_sets
+        col.operator("object.move_captured_meshes", icon='ARROW_LEFTRIGHT')
+        col.operator("object.rename_captured_meshes", icon='OUTLINER_DATA_MESH')
+
+        layout.separator()
+
+        col = layout.column()
+        col.enabled = has_sets
+        col.prop(scene, "hide_high", toggle=True, icon='HIDE_ON')
+        col.prop(scene, "hide_low", toggle=True, icon='HIDE_ON')
+
+        layout.separator()
+
+        col = layout.column()
+        col.enabled = has_sets
+        col.operator("object.reset_original_positions", icon='LOOP_BACK')
+
+
+# --------------------------------------------------
+# REGISTER
+# --------------------------------------------------
+
+classes = (
+    MeshSetItem,
+    OBJECT_OT_CaptureMeshes,
+    OBJECT_OT_MoveCapturedMeshes,
+    OBJECT_OT_RenameCapturedMeshes,
+    OBJECT_OT_ResetOriginalPositions,
+    OBJECT_PT_MoveCloseMeshes,
+)
+
+def register():
+    for c in classes:
+        bpy.utils.register_class(c)
+
+    bpy.types.Scene.centroid_threshold = bpy.props.FloatProperty(
+        name="Centroid Threshold",
+        default=1.0,
+        min=0.0
+    )
+
+    bpy.types.Scene.mesh_sets = bpy.props.CollectionProperty(
+        type=MeshSetItem
+    )
+
+    bpy.types.Scene.hide_high = bpy.props.BoolProperty(
+        name="Hide High Meshes",
+        update=update_hide_high
+    )
+
+    bpy.types.Scene.hide_low = bpy.props.BoolProperty(
+        name="Hide Low Meshes",
+        update=update_hide_low
+    )
+
+
+def unregister():
+    for c in reversed(classes):
+        bpy.utils.unregister_class(c)
+
+    del bpy.types.Scene.centroid_threshold
+    del bpy.types.Scene.mesh_sets
+    del bpy.types.Scene.hide_high
+    del bpy.types.Scene.hide_low
+
+
+if __name__ == "__main__":
+    register()
